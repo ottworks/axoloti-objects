@@ -1,0 +1,211 @@
+<objdefs appVersion="1.0.12">
+   <obj.normal id="12bitplayback" uuid="8bb6e66f-2394-4a7c-8e0f-9081479106bb">
+      <license>GPL</license>
+      <inlets>
+         <frac32 name="samplerate"/>
+         <frac32 name="note"/>
+         <bool32.risingfalling name="gate2"/>
+         <frac32 name="velocity"/>
+         <bool32 name="arm"/>
+         <int32 name="channel"/>
+         <frac32 name="adsr"/>
+         <frac32 name="pitch"/>
+         <bool32 name="pitchtrig"/>
+         <frac32 name="start"/>
+         <bool32 name="starttrig"/>
+         <frac32 name="end"/>
+         <bool32 name="endtrig"/>
+      </inlets>
+      <outlets>
+         <frac32buffer name="l"/>
+         <frac32buffer name="r"/>
+      </outlets>
+      <displays/>
+      <params/>
+      <attribs>
+         <objref name="data"/>
+      </attribs>
+      <code.declaration><![CDATA[static inline int16_t signextend4(const int16_t x)
+{
+	struct {int16_t x:4;} s;
+	return s.x = x;
+}
+
+struct Frame
+{
+	int8_t data[3];
+	Frame() : Frame(0, 0) {}
+	Frame(int16_t l_, int16_t r_)
+	{
+		data[0] = data[1] = data[2] = 0;
+		l(l_);
+		r(r_);
+	}
+	int16_t l()
+	{
+		return ((int16_t)data[0] << 4 & 0xFFF0) | ((int16_t)data[1] >> 4 & 0x00F);
+	}
+	void l(int16_t x)
+	{
+		data[0] = x >> 4;
+		data[1] = (data[1] & 0x0F) | (x << 4 & 0xF0);
+	}
+	int16_t r()
+	{
+		return (signextend4(data[1] & 0x0F) << 8 & 0xFF00) | ((int16_t)data[2] & 0x00FF);
+	}
+	void r(int16_t x)
+	{
+		data[1] = (data[1] & 0xF0) | (x >> 8 & 0x0F);
+		data[2] = x;
+	}
+};
+
+struct SampleData
+{
+	int8_t note;
+	uint8_t velocity;
+	uint8_t channel;
+	Frame *start;
+	int32_t length;
+	int32_t loop_start;
+	int32_t loop_end;
+	int32_t pitch;
+	int32_t samplerate;
+};
+
+
+struct PlaybackInfo
+{
+	SampleData *data;
+	int32_t play_pos;
+	bool forwards;
+};
+
+// 2.48847926267 samples at 48000khz per sample at 19288.88khz
+
+uint64_t phase = 0;
+
+Frame last_frame;
+
+PlaybackInfo info;
+
+bool note_not_found = false;
+
+int tick = 0;
+
+bool last_gate = false;]]></code.declaration>
+      <code.krate><![CDATA[int32_t freq = 0;
+int32_t note_difference;
+if (info.data)
+{
+	//if (inlet_starttrig)
+	{
+		info.data->loop_start = q27_to_float(inlet_start) * info.data->length;
+	}
+	//if (inlet_endtrig)
+	{
+		info.data->loop_end = q27_to_float(inlet_end) * info.data->length;
+	}
+	//if (inlet_pitchtrig)
+	{
+		info.data->pitch = inlet_pitch;
+	}
+
+	note_difference = inlet_note - (info.data->note << 20) + info.data->pitch;
+
+	MTOFEXTENDED(info.data->samplerate + 0xFA000000 + note_difference, freq);
+	
+	//++tick;
+	if (tick > 1000)
+	{
+		LogTextMessage("note difference(%d) note(%d)", note_difference >> 20, inlet_note >> 20);
+		tick = 0;
+	}
+}
+//MTOsFasdfEXTENDED(inlet_note, freq);
+//MTOFEXTENDED(inlet_samplerate, freq);
+if (!inlet_gate2)
+{
+	note_not_found = false;
+}
+if (!inlet_adsr) // the envelope is dead
+{
+	info.data = nullptr;
+	last_frame = Frame(0, 0);
+}
+if (inlet_gate2 && !last_gate && !inlet_arm && !note_not_found)
+{
+	SampleData *i = reinterpret_cast<SampleData *>(attr_data.array);
+	SampleData *best = i;
+	int32_t count = 0;
+	while (i->length)
+	{
+		int8_t nn = inlet_note >> 20;
+		if (i->length > 1 && i->channel == inlet_channel)
+		{
+			if (best->length == 1 || abs(i->note - nn) < abs(best->note - nn))
+			{
+				best = i;
+			}
+		}
+		i++;
+		count++;
+	}
+	if (best->length > 1)
+	{
+		info.data = best;
+		info.play_pos = 0;
+		last_frame = Frame(0, 0);
+		info.forwards = true;
+		LogTextMessage("found sample(%x), note(%d), length(%d)", info.data, info.data->note, info.data->length);
+	}
+	else
+	{
+		note_not_found = true;
+		LogTextMessage("note not found (%d tries)", count);
+	}
+}
+
+last_gate = inlet_gate2;
+
+for (int j = 0; j < BUFSIZE; j++) {
+	
+	if (info.data)
+	{
+		phase += (uint64_t)freq << 6;
+		while (phase >= (uint64_t)(1) << 32) {
+			phase -= (uint64_t)(1) << 32;
+			if (info.forwards) ++info.play_pos;
+			else --info.play_pos;
+		}
+
+		if (info.data->loop_start > info.data->loop_end) // ping pong
+		{
+			if (info.play_pos > info.data->loop_start)
+			{
+				info.forwards = false;
+				info.play_pos = info.data->loop_start;
+			}
+			if (info.play_pos <= info.data->loop_end)
+			{
+				info.forwards = true;
+				info.play_pos = info.data->loop_end;
+			}
+		}
+		else if (!info.forwards)
+		{
+			info.forwards = true;
+		}
+		else if (info.play_pos > info.data->loop_end)
+		{
+			info.play_pos = info.data->loop_start;
+		}
+		last_frame = *(info.data->start + info.play_pos);
+	}
+	
+	outlet_l[j] = last_frame.l() << 16;
+	outlet_r[j] = last_frame.r() << 16;
+}]]></code.krate>
+   </obj.normal>
+</objdefs>

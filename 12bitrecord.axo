@@ -1,0 +1,174 @@
+<objdefs appVersion="1.0.12">
+   <obj.normal id="12bitrecord" uuid="4b47b2a6-23cb-4bca-8a63-ff2fc40de8a8">
+      <license>GPL</license>
+      <inlets>
+         <frac32buffer name="l"/>
+         <frac32buffer name="r"/>
+         <frac32 name="samplerate"/>
+         <frac32 name="note"/>
+         <bool32.risingfalling name="gate2"/>
+         <frac32 name="velocity"/>
+         <bool32 name="arm"/>
+         <int32 name="channel"/>
+         <frac32 name="start"/>
+         <frac32 name="end"/>
+      </inlets>
+      <outlets>
+         <frac32buffer name="l"/>
+         <frac32buffer name="r"/>
+         <frac32 name="space"/>
+         <bool32 name="rec"/>
+      </outlets>
+      <displays/>
+      <params/>
+      <attribs>
+         <objref name="data"/>
+      </attribs>
+      <code.declaration><![CDATA[static inline int16_t signextend4(const int16_t x)
+{
+	struct {int16_t x:4;} s;
+	return s.x = x;
+}
+
+struct Frame
+{
+	int8_t data[3];
+	Frame() : Frame(0, 0) {}
+	Frame(int16_t l_, int16_t r_)
+	{
+		data[0] = data[1] = data[2] = 0;
+		l(l_);
+		r(r_);
+	}
+	int16_t l()
+	{
+		return ((int16_t)data[0] << 4 & 0xFFF0) | ((int16_t)data[1] >> 4 & 0x00F);
+	}
+	void l(int16_t x)
+	{
+		data[0] = x >> 4;
+		data[1] = (data[1] & 0x0F) | (x << 4 & 0xF0);
+	}
+	int16_t r()
+	{
+		return (signextend4(data[1] & 0x0F) << 8 & 0xFF00) | ((int16_t)data[2] & 0x00FF);
+	}
+	void r(int16_t x)
+	{
+		data[1] = (data[1] & 0xF0) | (x >> 8 & 0x0F);
+		data[2] = x;
+	}
+};
+
+struct SampleData
+{
+	int8_t note;
+	uint8_t velocity;
+	uint8_t channel;
+	Frame *start;
+	int32_t length;
+	int32_t loop_start;
+	int32_t loop_end;
+	int32_t pitch;
+	int32_t samplerate;
+};
+
+
+// 2.48847926267 samples at 48000khz per sample at 19288.88khz
+
+static const int32_t max_samples = 256;
+
+uint64_t phase = 0;
+
+Frame last_frame;
+
+int32_t tick = 0;
+
+bool was_recording = false;
+
+SampleData *current_data;
+
+Frame *first_frame;
+
+int32_t num_samples = 1;
+
+int32_t num_frames = 1;]]></code.declaration>
+      <code.init><![CDATA[current_data = reinterpret_cast<SampleData *>(attr_data.array);
+current_data->start = reinterpret_cast<Frame *>(attr_data.array) + sizeof(SampleData) * max_samples / sizeof(Frame);
+current_data->length = 1;
+
+first_frame = current_data->start;]]></code.init>
+      <code.krate><![CDATA[int32_t freq;
+MTOFEXTENDED(inlet_samplerate + 0xFA000000, freq);
+
+// ++tick;
+if (tick > 1000) {
+	tick = 0;
+	LogTextMessage("inlet(%d) freq(%d) prefreq(%d)", inlet_samplerate, freq, inlet_samplerate + 25165824 << 1);
+}
+
+if (!inlet_gate2)
+{
+	if (was_recording)
+	{
+		was_recording = false;
+		if (current_data != nullptr)
+		{
+			current_data->loop_start = q27_to_float(inlet_start) * current_data->length;
+			current_data->loop_end = q27_to_float(inlet_end) * current_data->length;
+			LogTextMessage("start(%d) end(%d)", current_data->loop_start, current_data->loop_end);
+		}
+	}
+	
+}
+else if (inlet_arm) // inlet_gate2 is true
+{
+	if (!was_recording && num_samples < max_samples - 1)
+	{
+		was_recording = true;
+		SampleData *last_data = current_data++;
+		
+		current_data->start = last_data->start + last_data->length;
+		current_data->length = 1;
+		current_data->note = inlet_note >> 20;
+		current_data->velocity = inlet_velocity >> 20;
+		current_data->channel = (uint8_t)inlet_channel;
+		current_data->samplerate = inlet_samplerate;
+
+		num_samples++;
+
+		LogTextMessage("last_data length: %d\ncurrent_data (%x): start(%x), length(%d), note(%d), velocity(%x)", last_data->length, current_data, current_data->start, current_data->length, current_data->note, current_data->velocity);
+	}
+}
+
+if ((int64_t)(current_data->start + current_data->length - first_frame) - (attr_data.LENGTH * (attr_data.BITS >> 3) / sizeof(Frame)) <= BUFSIZE)
+{
+	//was_recording = false;
+}
+	
+for (int j = 0; j < BUFSIZE; j++) {
+	phase += (uint64_t)freq << 6;
+	while (phase >= (uint64_t)(1) << 32 ) {
+		phase -= (uint64_t)(1) << 32;
+		last_frame = Frame(inlet_l[j] >> 16, inlet_r[j] >> 16);
+
+		//++tick;
+		
+		if (was_recording)
+		{
+			*(current_data->start + current_data->length++) = last_frame;
+		}
+	}
+	
+	outlet_l[j] = last_frame.l() << 16;
+	outlet_r[j] = last_frame.r() << 16;
+}
+
+if (current_data)
+{
+	outlet_space = (1 << 27) * (int64_t)(current_data->start + current_data->length - first_frame) / (attr_data.LENGTH * (attr_data.BITS >> 3) / sizeof(Frame));
+}
+
+outlet_rec = inlet_arm && ((!inlet_gate2) || was_recording);]]></code.krate>
+   </obj.normal>
+</objdefs>
